@@ -17,6 +17,12 @@ public struct WalletKit {
     private let templateDirectoryPath: String
     private let fileManager = FileManager.default
     
+    /// Creates a new `WalletKit`.
+    /// - parameters:
+    ///     - certificatePath: Path to the pass certificate.
+    ///     - certificatePassword: Password of the pass certificate.
+    ///     - wwdrPath: Path to the WWDR certificate https://developer.apple.com/certificationauthority/AppleWWDRCA.cer.
+    ///     - templateDirectoryPath: Path of the template to be used for the pass, containing the images etc.
     public init(certificatePath: String, certificatePassword: String, wwdrPath: String, templateDirectoryPath: String) {
         self.certificatePath = certificatePath
         self.certificatePassword = certificatePassword
@@ -24,6 +30,13 @@ public struct WalletKit {
         self.templateDirectoryPath = templateDirectoryPath
     }
     
+    /// Generate a signed .pkpass file
+    /// - parameters:
+    ///     - pass: A Pass object containing all pass information, ensure the `passTypeIdentifier` and `teamIdentifier` match those in supplied certificate.
+    ///     - destination: The destination of the .pkpass to be saved, if nil the pass will be saved to the execution directory (generally the case if the result Data is used).
+    ///     - arguments: An array of arguments to pass to the program.
+    ///     - worker: Worker to perform async task on.
+    /// - returns: A future containing the data of the generated pass.
     public func generatePass(pass: Pass, destination: String? = nil, on worker: Worker) throws -> Future<Data> {
         let directory = fileManager.currentDirectoryPath
         let temporaryDirectory = directory + UUID().uuidString + "/"
@@ -41,6 +54,7 @@ public struct WalletKit {
             let zipURL = URL(fileURLWithPath: destinationPath)
             return try self.zipPass(passURL: passURL, zipURL: zipURL, on: worker).map { try Data(contentsOf: zipURL) }
         }).catchMap { error in
+            // Ensure temporary directory is removed after a failure occurs
             try self.fileManager.removeItem(atPath: temporaryDirectory)
             throw error
         }
