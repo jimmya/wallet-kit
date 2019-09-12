@@ -24,49 +24,24 @@ public struct WalletKit {
         self.templateDirectoryPath = templateDirectoryPath
     }
     
-    public func savePass(pass: Pass, destination: String, on worker: Worker) throws -> Future<Void> {
-        return try generatePass(pass: pass, on: worker).map { passData in
-            self.fileManager.createFile(atPath: destination, contents: passData, attributes: nil)
-        }
-    }
-    
-    public func generatePass(pass: Pass, on worker: Worker) throws -> Future<Data> {
+    public func generatePass(pass: Pass, destination: String? = nil, on worker: Worker) throws -> Future<Data> {
         let directory = fileManager.currentDirectoryPath
         let temporaryDirectory = directory + UUID().uuidString + "/"
         let passDirectory = temporaryDirectory + "pass/"
         
-        do {
-            try fileManager.createDirectory(atPath: temporaryDirectory, withIntermediateDirectories: false, attributes: nil)
-            try fileManager.copyItem(atPath: templateDirectoryPath, toPath: passDirectory)
-            
-            let jsonEncoder = JSONEncoder()
-            jsonEncoder.dateEncodingStrategy = .iso8601
-            let passData: Data
-            do {
-                passData = try jsonEncoder.encode(pass)
-            } catch {
-                throw WalletKitError.invalidPassJSON
-            }
-            fileManager.createFile(atPath: passDirectory + "pass.json", contents: passData, attributes: nil)
-            
-            try generateManifest(directory: passDirectory)
-            
-            let keyGeneration = try generateKey(directory: temporaryDirectory, on: worker)
-            let certificateGeneration = try generateCertificate(directory: temporaryDirectory, on: worker)
-            
-            return flatMap(keyGeneration, certificateGeneration, { (_, _) in
-                return try self.generateSignature(directory: temporaryDirectory, passDirectory: passDirectory, on: worker)
-            }).map(to: Data.self, { _ in
-                let passURL = URL(fileURLWithPath: passDirectory, isDirectory: true)
-                let zipURL = URL(fileURLWithPath: temporaryDirectory + "/pass.pkpass")
-                try self.fileManager.zipItem(at: passURL, to: zipURL, shouldKeepParent: false)
-                return try Data(contentsOf: zipURL)
-            }).catchMap { error in
-                try self.fileManager.removeItem(atPath: temporaryDirectory)
-                throw error
-            }
-        } catch {
-            try fileManager.removeItem(atPath: temporaryDirectory)
+        let prepare = { try self.preparePass(pass: pass, temporaryDirectory: temporaryDirectory, passDirectory: passDirectory, on: worker) }
+        let manifest = { try self.generateManifest(directory: passDirectory, on: worker) }
+        return [prepare, manifest].syncFlatten(on: worker).flatMap(to: Void.self, {
+            let keyGeneration = try self.generateKey(directory: temporaryDirectory, on: worker)
+            let certificateGeneration = try self.generateCertificate(directory: temporaryDirectory, on: worker)
+            return [keyGeneration, certificateGeneration].flatten(on: worker)
+        }).flatMap(to: Data.self, { _ in
+            let passURL = URL(fileURLWithPath: passDirectory, isDirectory: true)
+            let destinationPath = destination ?? temporaryDirectory + "/pass.pkpass"
+            let zipURL = URL(fileURLWithPath: destinationPath)
+            return try self.zipPass(passURL: passURL, zipURL: zipURL, on: worker).map { try Data(contentsOf: zipURL) }
+        }).catchMap { error in
+            try self.fileManager.removeItem(atPath: temporaryDirectory)
             throw error
         }
     }
@@ -74,16 +49,49 @@ public struct WalletKit {
 
 private extension WalletKit {
     
-    func generateManifest(directory: String) throws {
-        let contents = try fileManager.contentsOfDirectory(atPath: directory)
-        var manifest: [String: String] = [:]
-        try contents.forEach({ (item) in
-            guard let data = fileManager.contents(atPath: directory + item) else { return }
-            let hash = try SHA1.hash(data).hexEncodedString()
-            manifest[item] = hash
-        })
-        let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: .prettyPrinted)
-        fileManager.createFile(atPath: directory + "manifest.json", contents: manifestData, attributes: nil)
+    func preparePass(pass: Pass, temporaryDirectory: String, passDirectory: String, on worker: Worker) throws -> EventLoopFuture<Void> {
+        let promise = worker.eventLoop.newPromise(Void.self)
+        DispatchQueue.global().async {
+            do {
+                try self.fileManager.createDirectory(atPath: temporaryDirectory, withIntermediateDirectories: false, attributes: nil)
+                try self.fileManager.copyItem(atPath: self.templateDirectoryPath, toPath: passDirectory)
+                
+                let jsonEncoder = JSONEncoder()
+                jsonEncoder.dateEncodingStrategy = .iso8601
+                let passData: Data
+                do {
+                    passData = try jsonEncoder.encode(pass)
+                } catch {
+                    throw WalletKitError.invalidPassJSON
+                }
+                self.fileManager.createFile(atPath: passDirectory + "pass.json", contents: passData, attributes: nil)
+                promise.succeed()
+            } catch {
+                promise.fail(error: error)
+            }
+        }
+        return promise.futureResult
+    }
+    
+    func generateManifest(directory: String, on worker: Worker) throws -> EventLoopFuture<Void> {
+        let promise = worker.eventLoop.newPromise(Void.self)
+        DispatchQueue.global().async {
+            do {
+                let contents = try self.fileManager.contentsOfDirectory(atPath: directory)
+                var manifest: [String: String] = [:]
+                try contents.forEach({ (item) in
+                    guard let data = self.fileManager.contents(atPath: directory + item) else { return }
+                    let hash = try SHA1.hash(data).hexEncodedString()
+                    manifest[item] = hash
+                })
+                let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: .prettyPrinted)
+                self.fileManager.createFile(atPath: directory + "manifest.json", contents: manifestData, attributes: nil)
+                promise.succeed()
+            } catch {
+                promise.fail(error: error)
+            }
+        }
+        return promise.futureResult
     }
     
     func generateKey(directory: String, on worker: Worker) throws -> EventLoopFuture<Void> {
@@ -146,5 +154,18 @@ private extension WalletKit {
                                             throw WalletKitError.cannotGenerateCertificate
                                         }
                                     })
+    }
+    
+    func zipPass(passURL: URL, zipURL: URL, on worker: Worker) throws -> EventLoopFuture<Void> {
+        let promise = worker.eventLoop.newPromise(Void.self)
+        DispatchQueue.global().async {
+            do {
+                try self.fileManager.zipItem(at: passURL, to: zipURL, shouldKeepParent: false)
+                promise.succeed()
+            } catch {
+                promise.fail(error: error)
+            }
+        }
+        return promise.futureResult
     }
 }
