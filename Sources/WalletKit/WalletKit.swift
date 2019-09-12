@@ -4,9 +4,9 @@ import ZIPFoundation
 
 enum WalletKitError: Error {
     case invalidPassJSON
-    case cannotGenerateKey(underlying: Error)
-    case cannotGenerateCertificate(underlying: Error)
-    case cannotGenerateSignature(underlying: Error)
+    case cannotGenerateKey
+    case cannotGenerateCertificate
+    case cannotGenerateSignature
 }
 
 public struct WalletKit {
@@ -24,42 +24,51 @@ public struct WalletKit {
         self.templateDirectoryPath = templateDirectoryPath
     }
     
-    public func savePass(pass: Pass, destination: String) throws {
-        let passData = try generatePass(pass: pass)
-        fileManager.createFile(atPath: destination, contents: passData, attributes: nil)
+    public func savePass(pass: Pass, destination: String, on worker: Worker) throws -> Future<Void> {
+        return try generatePass(pass: pass, on: worker).map { passData in
+            self.fileManager.createFile(atPath: destination, contents: passData, attributes: nil)
+        }
     }
     
-    public func generatePass(pass: Pass) throws -> Data {
+    public func generatePass(pass: Pass, on worker: Worker) throws -> Future<Data> {
         let directory = fileManager.currentDirectoryPath
         let temporaryDirectory = directory + UUID().uuidString + "/"
         let passDirectory = temporaryDirectory + "pass/"
-        defer {
-            try? fileManager.removeItem(atPath: temporaryDirectory)
-        }
-        try fileManager.createDirectory(atPath: temporaryDirectory, withIntermediateDirectories: false, attributes: nil)
-        try fileManager.copyItem(atPath: templateDirectoryPath, toPath: passDirectory)
         
-        let jsonEncoder = JSONEncoder()
-        jsonEncoder.dateEncodingStrategy = .iso8601
-        let passData: Data
         do {
-            passData = try jsonEncoder.encode(pass)
+            try fileManager.createDirectory(atPath: temporaryDirectory, withIntermediateDirectories: false, attributes: nil)
+            try fileManager.copyItem(atPath: templateDirectoryPath, toPath: passDirectory)
+            
+            let jsonEncoder = JSONEncoder()
+            jsonEncoder.dateEncodingStrategy = .iso8601
+            let passData: Data
+            do {
+                passData = try jsonEncoder.encode(pass)
+            } catch {
+                throw WalletKitError.invalidPassJSON
+            }
+            fileManager.createFile(atPath: passDirectory + "pass.json", contents: passData, attributes: nil)
+            
+            try generateManifest(directory: passDirectory)
+            
+            let keyGeneration = try generateKey(directory: temporaryDirectory, on: worker)
+            let certificateGeneration = try generateCertificate(directory: temporaryDirectory, on: worker)
+            
+            return flatMap(keyGeneration, certificateGeneration, { (_, _) in
+                return try self.generateSignature(directory: temporaryDirectory, passDirectory: passDirectory, on: worker)
+            }).map(to: Data.self, { _ in
+                let passURL = URL(fileURLWithPath: passDirectory, isDirectory: true)
+                let zipURL = URL(fileURLWithPath: temporaryDirectory + "/pass.pkpass")
+                try self.fileManager.zipItem(at: passURL, to: zipURL, shouldKeepParent: false)
+                return try Data(contentsOf: zipURL)
+            }).catchMap { error in
+                try self.fileManager.removeItem(atPath: temporaryDirectory)
+                throw error
+            }
         } catch {
-            throw WalletKitError.invalidPassJSON
+            try fileManager.removeItem(atPath: temporaryDirectory)
+            throw error
         }
-        fileManager.createFile(atPath: passDirectory + "pass.json", contents: passData, attributes: nil)
-        
-        try generateManifest(directory: passDirectory)
-        
-        try generateKey(directory: temporaryDirectory)
-        try generateCertificate(directory: temporaryDirectory)
-        
-        try generateSignature(directory: temporaryDirectory, passDirectory: passDirectory)
-        
-        let passURL = URL(fileURLWithPath: passDirectory, isDirectory: true)
-        let zipURL = URL(fileURLWithPath: temporaryDirectory + "/pass.pkpass")
-        try fileManager.zipItem(at: passURL, to: zipURL, shouldKeepParent: false)
-        return try Data(contentsOf: zipURL)
     }
 }
 
@@ -77,10 +86,9 @@ private extension WalletKit {
         fileManager.createFile(atPath: directory + "manifest.json", contents: manifestData, attributes: nil)
     }
     
-    func generateKey(directory: String) throws {
+    func generateKey(directory: String, on worker: Worker) throws -> EventLoopFuture<Void> {
         let keyPath = directory + "key.pem"
-        do {
-            _ = try Process.execute("openssl",
+        return Process.asyncExecute("openssl",
                                     "pkcs12",
                                     "-in",
                                     certificatePath,
@@ -90,16 +98,16 @@ private extension WalletKit {
                                     "-passin",
                                     "pass:" + certificatePassword,
                                     "-passout",
-                                    "pass:" + certificatePassword)
-        } catch {
-            throw WalletKitError.cannotGenerateKey(underlying: error)
-        }
+                                    "pass:" + certificatePassword, on: worker) { _ in }.map(to: Void.self, { result in
+                                        guard result == 0 else {
+                                            throw WalletKitError.cannotGenerateKey
+                                        }
+                                    })
     }
     
-    func generateCertificate(directory: String) throws {
+    func generateCertificate(directory: String, on worker: Worker) throws -> EventLoopFuture<Void> {
         let certPath = directory + "cert.pem"
-        do {
-            _ = try Process.execute("openssl",
+        return Process.asyncExecute("openssl",
                                     "pkcs12",
                                     "-in",
                                     certificatePath,
@@ -108,15 +116,15 @@ private extension WalletKit {
                                     "-out",
                                     certPath,
                                     "-passin",
-                                    "pass:" + certificatePassword)
-        } catch {
-            throw WalletKitError.cannotGenerateCertificate(underlying: error)
-        }
+                                    "pass:" + certificatePassword, on: worker) { _ in }.map(to: Void.self, { result in
+                                        guard result == 0 else {
+                                            throw WalletKitError.cannotGenerateCertificate
+                                        }
+                                    })
     }
     
-    func generateSignature(directory: String, passDirectory: String) throws {
-        do {
-            _ = try Process.execute("openssl",
+    func generateSignature(directory: String, passDirectory: String, on worker: Worker) throws -> EventLoopFuture<Void> {
+        return Process.asyncExecute("openssl",
                                     "smime",
                                     "-sign",
                                     "-signer",
@@ -133,9 +141,10 @@ private extension WalletKit {
                                     "der",
                                     "-binary",
                                     "-passin",
-                                    "pass:" + certificatePassword)
-        } catch {
-            throw WalletKitError.cannotGenerateSignature(underlying: error)
-        }
+                                    "pass:" + certificatePassword, on: worker) { _ in }.map(to: Void.self, { result in
+                                        guard result == 0 else {
+                                            throw WalletKitError.cannotGenerateCertificate
+                                        }
+                                    })
     }
 }
