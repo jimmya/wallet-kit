@@ -1,5 +1,6 @@
-import Core
-import Crypto
+import Foundation
+import NIO
+import OpenCrypto
 import ZIPFoundation
 
 enum WalletKitError: Error {
@@ -37,34 +38,41 @@ public struct WalletKit {
     ///     - arguments: An array of arguments to pass to the program.
     ///     - worker: Worker to perform async task on.
     /// - returns: A future containing the data of the generated pass.
-    public func generatePass(pass: Pass, destination: String? = nil, on worker: Worker) throws -> Future<Data> {
+    public func generatePass(pass: Pass, destination: String? = nil, on eventLoop: EventLoop) throws -> EventLoopFuture<Data> {
         let directory = fileManager.currentDirectoryPath
         let temporaryDirectory = directory + UUID().uuidString + "/"
         let passDirectory = temporaryDirectory + "pass/"
         
-        let prepare = { try self.preparePass(pass: pass, temporaryDirectory: temporaryDirectory, passDirectory: passDirectory, on: worker) }
-        let manifest = { try self.generateManifest(directory: passDirectory, on: worker) }
-        return [prepare, manifest].syncFlatten(on: worker).flatMap(to: Void.self, {
-            let keyGeneration = try self.generateKey(directory: temporaryDirectory, on: worker)
-            let certificateGeneration = try self.generateCertificate(directory: temporaryDirectory, on: worker)
-            return [keyGeneration, certificateGeneration].flatten(on: worker)
-        }).flatMap(to: Data.self, { _ in
+        let prepare = preparePass(pass: pass, temporaryDirectory: temporaryDirectory, passDirectory: passDirectory, on: eventLoop)
+        return prepare.flatMap { _ in
+            return self.generateManifest(directory: passDirectory, on: eventLoop)
+        }.flatMap { _ in
+            return self.generateKey(directory: temporaryDirectory, on: eventLoop)
+        }.flatMap { _ in
+            return self.generateCertificate(directory: temporaryDirectory, on: eventLoop)
+        }.flatMap { _ in
+            return self.generateSignature(directory: temporaryDirectory, passDirectory: passDirectory, on: eventLoop)
+        }.flatMap { _ in
             let passURL = URL(fileURLWithPath: passDirectory, isDirectory: true)
             let destinationPath = destination ?? temporaryDirectory + "/pass.pkpass"
             let zipURL = URL(fileURLWithPath: destinationPath)
-            return try self.zipPass(passURL: passURL, zipURL: zipURL, on: worker).map { try Data(contentsOf: zipURL) }
-        }).catchMap { error in
-            // Ensure temporary directory is removed after a failure occurs
-            try self.fileManager.removeItem(atPath: temporaryDirectory)
-            throw error
+            return self.zipPass(passURL: passURL, zipURL: zipURL, on: eventLoop).flatMap { _ in
+                do {
+                    return eventLoop.makeSucceededFuture(try Data(contentsOf: zipURL))
+                } catch {
+                    return eventLoop.makeFailedFuture(error)
+                }
+            }
+        }.always { _ in
+            try? self.fileManager.removeItem(atPath: temporaryDirectory)
         }
     }
 }
 
 private extension WalletKit {
     
-    func preparePass(pass: Pass, temporaryDirectory: String, passDirectory: String, on worker: Worker) throws -> EventLoopFuture<Void> {
-        let promise = worker.eventLoop.newPromise(Void.self)
+    func preparePass(pass: Pass, temporaryDirectory: String, passDirectory: String, on eventLoop: EventLoop) -> EventLoopFuture<Void> {
+        let promise = eventLoop.makePromise(of: Void.self)
         DispatchQueue.global().async {
             do {
                 try self.fileManager.createDirectory(atPath: temporaryDirectory, withIntermediateDirectories: false, attributes: nil)
@@ -79,36 +87,36 @@ private extension WalletKit {
                     throw WalletKitError.invalidPassJSON
                 }
                 self.fileManager.createFile(atPath: passDirectory + "pass.json", contents: passData, attributes: nil)
-                promise.succeed()
+                promise.succeed(())
             } catch {
-                promise.fail(error: error)
+                promise.fail(error)
             }
         }
         return promise.futureResult
     }
     
-    func generateManifest(directory: String, on worker: Worker) throws -> EventLoopFuture<Void> {
-        let promise = worker.eventLoop.newPromise(Void.self)
+    func generateManifest(directory: String, on eventLoop: EventLoop) -> EventLoopFuture<Void> {
+        let promise = eventLoop.makePromise(of: Void.self)
         DispatchQueue.global().async {
             do {
                 let contents = try self.fileManager.contentsOfDirectory(atPath: directory)
                 var manifest: [String: String] = [:]
-                try contents.forEach({ (item) in
+                contents.forEach({ (item) in
                     guard let data = self.fileManager.contents(atPath: directory + item) else { return }
-                    let hash = try SHA1.hash(data).hexEncodedString()
-                    manifest[item] = hash
+                    let hash = Insecure.SHA1.hash(data: data)
+                    manifest[item] = hash.description
                 })
                 let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: .prettyPrinted)
                 self.fileManager.createFile(atPath: directory + "manifest.json", contents: manifestData, attributes: nil)
-                promise.succeed()
+                promise.succeed(())
             } catch {
-                promise.fail(error: error)
+                promise.fail(error)
             }
         }
         return promise.futureResult
     }
     
-    func generateKey(directory: String, on worker: Worker) throws -> EventLoopFuture<Void> {
+    func generateKey(directory: String, on eventLoop: EventLoop) -> EventLoopFuture<Void> {
         let keyPath = directory + "key.pem"
         return Process.asyncExecute("openssl",
                                     "pkcs12",
@@ -120,14 +128,14 @@ private extension WalletKit {
                                     "-passin",
                                     "pass:" + certificatePassword,
                                     "-passout",
-                                    "pass:" + certificatePassword, on: worker) { _ in }.map(to: Void.self, { result in
+                                    "pass:" + certificatePassword, on: eventLoop) { _ in }.flatMapThrowing { result in
                                         guard result == 0 else {
                                             throw WalletKitError.cannotGenerateKey
                                         }
-                                    })
+        }
     }
     
-    func generateCertificate(directory: String, on worker: Worker) throws -> EventLoopFuture<Void> {
+    func generateCertificate(directory: String, on eventLoop: EventLoop) -> EventLoopFuture<Void> {
         let certPath = directory + "cert.pem"
         return Process.asyncExecute("openssl",
                                     "pkcs12",
@@ -138,14 +146,14 @@ private extension WalletKit {
                                     "-out",
                                     certPath,
                                     "-passin",
-                                    "pass:" + certificatePassword, on: worker) { _ in }.map(to: Void.self, { result in
+                                    "pass:" + certificatePassword, on: eventLoop) { _ in }.flatMapThrowing { result in
                                         guard result == 0 else {
                                             throw WalletKitError.cannotGenerateCertificate
                                         }
-                                    })
+        }
     }
     
-    func generateSignature(directory: String, passDirectory: String, on worker: Worker) throws -> EventLoopFuture<Void> {
+    func generateSignature(directory: String, passDirectory: String, on eventLoop: EventLoop) -> EventLoopFuture<Void> {
         return Process.asyncExecute("openssl",
                                     "smime",
                                     "-sign",
@@ -163,21 +171,21 @@ private extension WalletKit {
                                     "der",
                                     "-binary",
                                     "-passin",
-                                    "pass:" + certificatePassword, on: worker) { _ in }.map(to: Void.self, { result in
+                                    "pass:" + certificatePassword, on: eventLoop) { _ in }.flatMapThrowing { result in
                                         guard result == 0 else {
                                             throw WalletKitError.cannotGenerateCertificate
                                         }
-                                    })
+        }
     }
     
-    func zipPass(passURL: URL, zipURL: URL, on worker: Worker) throws -> EventLoopFuture<Void> {
-        let promise = worker.eventLoop.newPromise(Void.self)
+    func zipPass(passURL: URL, zipURL: URL, on eventLoop: EventLoop) -> EventLoopFuture<Void> {
+        let promise = eventLoop.makePromise(of: Void.self)
         DispatchQueue.global().async {
             do {
                 try self.fileManager.zipItem(at: passURL, to: zipURL, shouldKeepParent: false)
-                promise.succeed()
+                promise.succeed(())
             } catch {
-                promise.fail(error: error)
+                promise.fail(error)
             }
         }
         return promise.futureResult
