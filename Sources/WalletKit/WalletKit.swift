@@ -42,6 +42,9 @@ public struct WalletKit {
         let directory = fileManager.currentDirectoryPath
         let temporaryDirectory = directory + UUID().uuidString + "/"
         let passDirectory = temporaryDirectory + "pass/"
+        let passURL = URL(fileURLWithPath: passDirectory, isDirectory: true)
+        let destinationPath = destination ?? temporaryDirectory + "/pass.pkpass"
+        let zipURL = URL(fileURLWithPath: destinationPath)
         
         let prepare = preparePass(pass: pass, temporaryDirectory: temporaryDirectory, passDirectory: passDirectory, on: eventLoop)
         return prepare.flatMap { _ in
@@ -53,16 +56,9 @@ public struct WalletKit {
         }.flatMap { _ in
             return self.generateSignature(directory: temporaryDirectory, passDirectory: passDirectory, on: eventLoop)
         }.flatMap { _ in
-            let passURL = URL(fileURLWithPath: passDirectory, isDirectory: true)
-            let destinationPath = destination ?? temporaryDirectory + "/pass.pkpass"
-            let zipURL = URL(fileURLWithPath: destinationPath)
-            return self.zipPass(passURL: passURL, zipURL: zipURL, on: eventLoop).flatMap { _ in
-                do {
-                    return eventLoop.makeSucceededFuture(try Data(contentsOf: zipURL))
-                } catch {
-                    return eventLoop.makeFailedFuture(error)
-                }
-            }
+            return self.zipPass(passURL: passURL, zipURL: zipURL, on: eventLoop)
+        }.flatMapThrowing { _ in
+            return try Data(contentsOf: zipURL)
         }.always { _ in
             try? self.fileManager.removeItem(atPath: temporaryDirectory)
         }

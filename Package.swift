@@ -8,6 +8,9 @@ let package = Package(
     platforms: [
         .macOS(.v10_12)
     ],
+    products: [
+        .library(name: "WalletKit", targets: ["WalletKit"]),
+    ],
     dependencies: [
         // Dependencies declare other packages that this package depends on.
         // .package(url: /* package url */, from: "1.0.0"),
